@@ -1,0 +1,9 @@
+requests==2.31.0
+beautifulsoup4==4.12.2
+python-dotenv==1.0.0
+supabase==2.0.3
+dataclasses-json==0.6.1
+requests-html==0.10.0
+webdriver-manager==4.0.1
+selenium==4.14.0
+concurrent.futures==3.1.0
