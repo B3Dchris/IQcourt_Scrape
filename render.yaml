@@ -1,0 +1,10 @@
+# render.yaml
+services:
+  - type: cron
+    name: padel-scraper
+    schedule: "0 4 * * *"  # 6AM South African time (UTC+2 -> cron uses UTC)
+    env: python
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python padelv2.py"
+    region: Franfurt
