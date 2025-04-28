@@ -138,28 +138,36 @@ def prepare_slots_data(structured_data, club_id, booking_date, scrape_id):
 
 def save_json(structured_data):
     try:
-        folder = f"webscrape/Scraped data/supabase_ready/{datetime.now().strftime('%Y-%m-%d')}"
-        os.makedirs(folder, exist_ok=True)
-        file_path = os.path.join(folder, "courts.json")
+        # Prepare the JSON content in memory
+        combined_data = {
+            "booking_date": structured_data['booking_date'],
+            "scrape_timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "clubs": [
+                {
+                    "club_name": structured_data['club_name'],
+                    "courts": structured_data['courts']
+                }
+            ]
+        }
 
-        if os.path.exists(file_path):
-            with open(file_path, 'r') as f:
-                existing = json.load(f)
-        else:
-            existing = {"booking_date": structured_data['booking_date'], "scrape_timestamp": structured_data['scrape_timestamp'], "clubs": []}
+        # Convert JSON to bytes
+        json_bytes = json.dumps(combined_data, indent=4).encode('utf-8')
 
-        existing['clubs'].append({
-            "club_name": structured_data['club_name'],
-            "courts": structured_data['courts']
-        })
+        # Prepare upload path like 2025-04-28/courts.json
+        upload_path = f"{datetime.now().strftime('%Y-%m-%d')}/courts.json"
 
-        with open(file_path, 'w') as f:
-            json.dump(existing, f, indent=4)
+        # Upload to Supabase Storage
+        supabase.storage.from_("scraped-json").upload(
+            path=upload_path,
+            file=json_bytes,
+            options={"content-type": "application/json", "cache-control": "3600", "upsert": True}
+        )
 
-        print(f"Saved JSON for {structured_data['club_name']}")
+        print(f"✅ Uploaded JSON directly to Supabase Storage: scraped-json/{upload_path}")
 
     except Exception as e:
-        print(f"Error saving JSON: {str(e)}")
+        print(f"❌ Error uploading JSON: {str(e)}")
+
 
 def insert_into_supabase(slots_data):
     try:
