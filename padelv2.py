@@ -10,7 +10,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from supabase import create_client
 from dotenv import load_dotenv
-import uuid
+import tempfile
 import math
 
 # Load environment variables
@@ -23,7 +23,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 print("Supabase URL:", SUPABASE_URL)
 print("Supabase Key:", (SUPABASE_KEY[:5] + "..." if SUPABASE_KEY else "Not found"))
 
-
 def fetch_club_urls():
     try:
         response = supabase.table("clubs").select("id, name, url").execute()
@@ -32,6 +31,17 @@ def fetch_club_urls():
         print(f"Exception fetching clubs: {str(e)}")
         return []
 
+def setup_chrome_options():
+    options = Options()
+    options.add_argument('--headless')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1920,1080')
+    temp_profile = tempfile.mkdtemp()
+    options.add_argument(f"--user-data-dir={temp_profile}")
+    options.add_experimental_option('excludeSwitches', ['enable-logging'])
+    return options
 
 def get_court_availability(url, clubs_data, scrape_id):
     driver = None
@@ -48,45 +58,29 @@ def get_court_availability(url, clubs_data, scrape_id):
             club_id = None
             print(f"Warning: Could not find club info for URL: {url}")
 
-        options = Options()
-        options.add_argument('--headless')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--start-maximized')
-        options.add_argument('--log-level=3')
-        options.add_experimental_option('excludeSwitches', ['enable-logging'])
-
+        options = setup_chrome_options()
         driver = webdriver.Chrome(options=options)
         driver.get(url)
         wait = WebDriverWait(driver, 10)
 
-        # Wait for the booking date element
-        wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, 
+        wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR,
             "#root > div > div.page > div.page__body > div.page__content > div > div.new_tenant__body > div.new_tenant__main > div:nth-child(1) > div > div.bbq2__search > div:nth-child(2) > div > div > button > span.bbq2__drop__toggle__label")))
-        
         booking_date = datetime.now().strftime('%Y-%m-%d')
 
-        # Wait for grid to load
-        wait.until(EC.presence_of_element_located((By.XPATH, 
+        wait.until(EC.presence_of_element_located((By.XPATH,
             "//*[@id='root']/div/div[2]/div[2]/div[1]/div/div[3]/div[1]/div[1]")))
         time.sleep(10)
 
-        grid_element = driver.find_element(By.CSS_SELECTOR, 
+        grid_element = driver.find_element(By.CSS_SELECTOR,
             "#root > div > div.page > div.page__body > div.page__content > div > div.new_tenant__body > div.new_tenant__main > div:nth-child(1) > div > div.bbq2__grid")
 
         court_names = grid_element.find_elements(By.CLASS_NAME, "bbq2__resource__label")
         court_names_text = [court.text.strip() for court in court_names]
 
-        # Grid parameters
         grid_start_offset = 350
         pixels_per_hour = 39
 
-        # Club-specific time calibration
-        if "Playmore" in club_name:
-            time_calibration_offset = +1.0
-        elif "Playpadelhartbeespoort" in club_name:
-            time_calibration_offset = +1.0
-        elif "Lynnwood Glen" in club_name:
+        if "Playmore" in club_name or "Playpadelhartbeespoort" in club_name or "Lynnwood Glen" in club_name:
             time_calibration_offset = +1.0
         elif "Moove Motion Fitness Club Sunninghill" in club_name:
             time_calibration_offset = 0.0
@@ -106,7 +100,7 @@ def get_court_availability(url, clubs_data, scrape_id):
             if court_index < len(availability_slots_resources):
                 slots_resource = availability_slots_resources[court_index]
                 slots = slots_resource.find_elements(By.XPATH, ".//div[contains(@class, 'bbq2__hole')]")
-                
+
                 court_availability = []
                 for slot in slots:
                     slot_position = slot.location['x']
@@ -121,10 +115,7 @@ def get_court_availability(url, clubs_data, scrape_id):
                     if start_hour_floor < 6:
                         start_hour_floor = 6
                         start_minute = 0
-                    elif start_hour_floor >= 23 and start_minute > 0:
-                        start_hour_floor = 23
-                        start_minute = 30
-                    elif start_hour_floor > 23:
+                    elif start_hour_floor >= 23:
                         start_hour_floor = 23
                         start_minute = 30
 
@@ -166,7 +157,8 @@ def get_court_availability(url, clubs_data, scrape_id):
         if driver:
             driver.quit()
 
-
+# (Continue remaining functions exactly as you have them)
+#from here
 def prepare_slots_data(structured_data, club_id, booking_date, scrape_id):
     slots_data = []
     for court in structured_data["courts"]:
