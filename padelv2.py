@@ -313,7 +313,7 @@ def update_scrape_run(scrape_id, status, slots_scraped, clubs_covered):
 
 def scrape_all_clubs(club_data, scrape_id):
     slots_per_club = {}
-    with ThreadPoolExecutor(max_workers=15) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(get_court_availability, club['url'], club_data, scrape_id): club['name'] for club in club_data}
 
         for future in futures:
