@@ -10,12 +10,10 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from supabase import create_client
 from dotenv import load_dotenv
-import tempfile
 import math
 
 # Load environment variables
 load_dotenv()
-
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -31,63 +29,35 @@ def fetch_club_urls():
         print(f"Exception fetching clubs: {str(e)}")
         return []
 
-def setup_chrome_options():
-    options = Options()
-    options.add_argument('--headless')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--window-size=1920,1080')
-    temp_profile = tempfile.mkdtemp()
-    options.add_argument(f"--user-data-dir={temp_profile}")
-    options.add_experimental_option('excludeSwitches', ['enable-logging'])
-    return options
-
 def get_court_availability(url, clubs_data, scrape_id):
     driver = None
     try:
         uuid_from_url = url.split('/')[-1].split('?')[0]
         club_info = next((club for club in clubs_data if uuid_from_url in club['url']), None)
 
-        if club_info:
-            club_name = club_info['name']
-            club_id = club_info['id']
-            print(f"Found club: {club_name} with ID: {club_id}")
-        else:
-            club_name = "Unknown Club"
-            club_id = None
-            print(f"Warning: Could not find club info for URL: {url}")
+        club_name = club_info['name'] if club_info else "Unknown Club"
+        club_id = club_info['id'] if club_info else None
+        print(f"Scraping: {club_name}")
 
-        options = setup_chrome_options()
+        options = Options()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--start-maximized')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--disable-infobars')
+        options.add_argument('--window-size=1920,1080')
         driver = webdriver.Chrome(options=options)
         driver.get(url)
-        wait = WebDriverWait(driver, 10)
 
-        wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR,
-            "#root > div > div.page > div.page__body > div.page__content > div > div.new_tenant__body > div.new_tenant__main > div:nth-child(1) > div > div.bbq2__search > div:nth-child(2) > div > div > button > span.bbq2__drop__toggle__label")))
+        wait = WebDriverWait(driver, 15)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#root .bbq2__grid")))
+        time.sleep(2)
+
         booking_date = datetime.now().strftime('%Y-%m-%d')
-
-        wait.until(EC.presence_of_element_located((By.XPATH,
-            "//*[@id='root']/div/div[2]/div[2]/div[1]/div/div[3]/div[1]/div[1]")))
-        time.sleep(10)
-
-        grid_element = driver.find_element(By.CSS_SELECTOR,
-            "#root > div > div.page > div.page__body > div.page__content > div > div.new_tenant__body > div.new_tenant__main > div:nth-child(1) > div > div.bbq2__grid")
-
-        court_names = grid_element.find_elements(By.CLASS_NAME, "bbq2__resource__label")
-        court_names_text = [court.text.strip() for court in court_names]
-
-        grid_start_offset = 350
-        pixels_per_hour = 39
-
-        if "Playmore" in club_name or "Playpadelhartbeespoort" in club_name or "Lynnwood Glen" in club_name:
-            time_calibration_offset = +1.0
-        elif "Moove Motion Fitness Club Sunninghill" in club_name:
-            time_calibration_offset = 0.0
-        else:
-            time_calibration_offset = -1.0
-
-        availability_slots_resources = grid_element.find_elements(By.CLASS_NAME, "bbq2__slots-resource")
+        grid_element = driver.find_element(By.CSS_SELECTOR, "#root .bbq2__grid")
+        court_names = [c.text.strip() for c in grid_element.find_elements(By.CLASS_NAME, "bbq2__resource__label")]
+        slots_resources = grid_element.find_elements(By.CLASS_NAME, "bbq2__slots-resource")
 
         structured_data = {
             "club_name": club_name,
@@ -96,247 +66,190 @@ def get_court_availability(url, clubs_data, scrape_id):
             "courts": []
         }
 
-        for court_index, court_name in enumerate(court_names_text):
-            if court_index < len(availability_slots_resources):
-                slots_resource = availability_slots_resources[court_index]
-                slots = slots_resource.find_elements(By.XPATH, ".//div[contains(@class, 'bbq2__hole')]")
+        grid_start_offset = 350
+        pixels_per_hour = 39
+        calibration = +1.0 if any(x in club_name for x in ["Playmore", "Playpadelhartbeespoort", "Lynnwood Glen"]) else 0.0
 
-                court_availability = []
-                for slot in slots:
-                    slot_position = slot.location['x']
-                    slot_width = slot.size['width']
+        for court_index, court_name in enumerate(court_names):
+            if court_index >= len(slots_resources):
+                continue
 
-                    start_pos_relative = slot_position - grid_start_offset
-                    start_hour_exact = start_pos_relative / pixels_per_hour + time_calibration_offset
+            slots = slots_resources[court_index].find_elements(By.XPATH, ".//div[contains(@class, 'bbq2__hole')]")
+            court_slots = []
 
-                    start_hour_floor = math.floor(start_hour_exact)
-                    start_minute = 30 if start_hour_exact - start_hour_floor >= 0.5 else 0
+            for slot in slots:
+                x = slot.location['x']
+                width = slot.size['width']
+                start_hour = (x - grid_start_offset) / pixels_per_hour + calibration
+                end_hour = (x + width - grid_start_offset) / pixels_per_hour + calibration
 
-                    if start_hour_floor < 6:
-                        start_hour_floor = 6
-                        start_minute = 0
-                    elif start_hour_floor >= 23:
-                        start_hour_floor = 23
-                        start_minute = 30
+                start_h, start_m = divmod(round(start_hour * 60), 60)
+                end_h, end_m = divmod(round(end_hour * 60), 60)
 
-                    start_time = f"{start_hour_floor:02d}:{start_minute:02d}"
+                if start_h < 6: start_h, start_m = 6, 0
+                if end_h > 23: end_h, end_m = 23, 59
 
-                    end_pos_relative = start_pos_relative + slot_width
-                    end_hour_exact = end_pos_relative / pixels_per_hour + time_calibration_offset
-
-                    end_hour_floor = math.floor(end_hour_exact)
-                    end_minute = 30 if end_hour_exact - end_hour_floor >= 0.5 else 0
-
-                    actual_end_hour = end_hour_floor % 24
-                    end_time = f"{actual_end_hour:02d}:{end_minute:02d}"
-
-                    court_availability.append({
-                        'start_time': start_time,
-                        'end_time': end_time,
-                        'status': 'Booked'
-                    })
-
-                structured_data["courts"].append({
-                    'name': court_name,
-                    'slots': court_availability
+                court_slots.append({
+                    'start_time': f"{start_h:02d}:{start_m:02d}",
+                    'end_time': f"{end_h:02d}:{end_m:02d}",
+                    'status': 'Booked'
                 })
+
+            structured_data["courts"].append({
+                'name': court_name,
+                'slots': court_slots
+            })
 
         save_json(structured_data)
         slots_data = prepare_slots_data(structured_data, club_id, booking_date, scrape_id)
-
         if slots_data:
             insert_into_supabase(slots_data)
 
         return len(slots_data)
 
     except Exception as e:
-        print(f"Error occurred for {club_name if 'club_name' in locals() else url}: {str(e)}")
+        print(f"Error scraping {url}: {str(e)}")
         return 0
-
     finally:
         if driver:
             driver.quit()
 
-# (Continue remaining functions exactly as you have them)
-#from here
 def prepare_slots_data(structured_data, club_id, booking_date, scrape_id):
     slots_data = []
     for court in structured_data["courts"]:
         court_id = ensure_court_exists(club_id, court['name'])
         if not court_id:
             continue
-        
         for slot in court['slots']:
-            start_hour, start_minute = map(int, slot['start_time'].split(':'))
-            end_hour, end_minute = map(int, slot['end_time'].split(':'))
-
-            duration_minutes = (end_hour - start_hour) * 60 + (end_minute - start_minute)
-
-            slot_data = {
+            sh, sm = map(int, slot['start_time'].split(":"))
+            eh, em = map(int, slot['end_time'].split(":"))
+            duration = (eh - sh) * 60 + (em - sm)
+            slots_data.append({
                 'court_id': court_id,
                 'booking_date': booking_date,
                 'start_time': slot['start_time'],
                 'end_time': slot['end_time'],
                 'availability': False,
-                'duration_minutes': duration_minutes,
+                'duration_minutes': duration,
                 'scrape_id': scrape_id,
-                'scrape_timestamp': structured_data["scrape_timestamp"]
-            }
-            slots_data.append(slot_data)
+                'scrape_timestamp': structured_data['scrape_timestamp']
+            })
     return slots_data
-
 
 def save_json(structured_data):
     try:
-        base_folder = 'webscrape/Scraped data/supabase_ready'
-        today_folder = os.path.join(base_folder, datetime.now().strftime('%Y-%m-%d'))
-        os.makedirs(today_folder, exist_ok=True)
+        folder = f"webscrape/Scraped data/supabase_ready/{datetime.now().strftime('%Y-%m-%d')}"
+        os.makedirs(folder, exist_ok=True)
+        file_path = os.path.join(folder, "courts.json")
 
-        combined_file_path = os.path.join(today_folder, 'courts.json')
-
-        if os.path.exists(combined_file_path):
-            with open(combined_file_path, 'r') as f:
-                existing_data = json.load(f)
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as f:
+                existing = json.load(f)
         else:
-            existing_data = {
-                "booking_date": structured_data['booking_date'],
-                "scrape_timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                "clubs": []
-            }
+            existing = {"booking_date": structured_data['booking_date'], "scrape_timestamp": structured_data['scrape_timestamp'], "clubs": []}
 
-        club_entry = {
+        existing['clubs'].append({
             "club_name": structured_data['club_name'],
             "courts": structured_data['courts']
-        }
+        })
 
-        existing_data['clubs'].append(club_entry)
+        with open(file_path, 'w') as f:
+            json.dump(existing, f, indent=4)
 
-        with open(combined_file_path, 'w') as f:
-            json.dump(existing_data, f, indent=4)
-
-        print(f"Saved club '{structured_data['club_name']}' to {combined_file_path}")
+        print(f"Saved JSON for {structured_data['club_name']}")
 
     except Exception as e:
-        print(f"Error saving combined JSON: {str(e)}")
-
+        print(f"Error saving JSON: {str(e)}")
 
 def insert_into_supabase(slots_data):
     try:
         if not slots_data:
             return
-
         batch_size = 100
-        total_slots = len(slots_data)
-        successful_inserts = 0
-        errors = 0
+        total, success, fail = len(slots_data), 0, 0
 
-        print(f"Inserting {total_slots} slots into Supabase... (historical mode)")
-
-        for i in range(0, total_slots, batch_size):
+        print(f"Inserting {total} slots...")
+        for i in range(0, total, batch_size):
             batch = slots_data[i:i + batch_size]
             try:
-                response = supabase.table("slots").insert(batch).execute()
-                if response.data:
-                    successful_inserts += len(response.data)
+                resp = supabase.table("slots").insert(batch).execute()
+                if resp.data:
+                    success += len(resp.data)
             except Exception as e:
-                errors += len(batch)
-                print(f"Error inserting batch: {str(e)}")
+                print(f"Insert batch error: {str(e)}")
+                fail += len(batch)
 
-        print(f"✔️ {successful_inserts} slots inserted. ❌ {errors} slots failed.")
+        print(f"✔️ {success} inserted, ❌ {fail} failed.")
 
     except Exception as e:
-        print(f"Fatal error inserting into Supabase: {str(e)}")
-
+        print(f"Fatal error inserting to Supabase: {str(e)}")
 
 def ensure_court_exists(club_id, court_name):
     try:
         if not club_id:
             return None
-
-        response = supabase.table("courts").select("*").eq("club_id", club_id).eq("name", court_name).execute()
-
-        if response.data and len(response.data) > 0:
-            return response.data[0]['id']
-        else:
-            court_data = {
-                'club_id': club_id,
-                'name': court_name,
-                'created_at': datetime.now().isoformat()
-            }
-            create_response = supabase.table("courts").insert(court_data).execute()
-            if create_response.data and len(create_response.data) > 0:
-                return create_response.data[0]['id']
+        existing = supabase.table("courts").select("*").eq("club_id", club_id).eq("name", court_name).execute()
+        if existing.data:
+            return existing.data[0]['id']
+        new = supabase.table("courts").insert({'club_id': club_id, 'name': court_name, 'created_at': datetime.now().isoformat()}).execute()
+        return new.data[0]['id'] if new.data else None
     except Exception as e:
-        print(f"Error ensuring court exists: {str(e)}")
-    return None
-
+        print(f"Error ensuring court: {str(e)}")
+        return None
 
 def create_scrape_run():
     try:
-        scrape_run_data = {
+        data = {
             'run_at': datetime.now().isoformat(),
             'booking_date': datetime.now().strftime('%Y-%m-%d'),
-            'source': 'padel_scrape_enhanced.py',
-            'notes': 'Automated scrape of playtomic courts',
+            'source': 'padelv2.py',
+            'notes': 'Automated playtomic scrape',
             'slots_scraped': 0,
             'clubs_covered': 0,
             'scrape_status': 'in_progress'
         }
-        response = supabase.table("scrape_runs").insert(scrape_run_data).execute()
-        return response.data[0]['id'] if response.data else None
+        resp = supabase.table("scrape_runs").insert(data).execute()
+        return resp.data[0]['id'] if resp.data else None
     except Exception as e:
         print(f"Error creating scrape run: {str(e)}")
         return None
 
-
-def update_scrape_run(scrape_id, status, slots_scraped, clubs_covered):
+def update_scrape_run(scrape_id, status, slots, clubs):
     try:
-        update_data = {
-            'scrape_status': status,
-            'slots_scraped': slots_scraped,
-            'clubs_covered': clubs_covered
-        }
-        response = supabase.table("scrape_runs").update(update_data).eq('id', scrape_id).execute()
+        data = {'scrape_status': status, 'slots_scraped': slots, 'clubs_covered': clubs}
+        supabase.table("scrape_runs").update(data).eq('id', scrape_id).execute()
         return True
     except Exception as e:
         print(f"Error updating scrape run: {str(e)}")
         return False
 
-
 def scrape_all_clubs(club_data, scrape_id):
-    slots_per_club = {}
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(get_court_availability, club['url'], club_data, scrape_id): club['name'] for club in club_data}
-
+    results = {}
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {ex.submit(get_court_availability, club['url'], club_data, scrape_id): club['name'] for club in club_data}
         for future in futures:
             club_name = futures[future]
             try:
-                slot_count = future.result()
-                slots_per_club[club_name] = slot_count
+                results[club_name] = future.result()
             except Exception as e:
-                print(f"Error processing {club_name}: {str(e)}")
-                slots_per_club[club_name] = 0
-    return slots_per_club
-
+                print(f"Error on {club_name}: {str(e)}")
+                results[club_name] = 0
+    return results
 
 def main():
     scrape_id = create_scrape_run()
     if not scrape_id:
-        print("Failed to create scrape run. Exiting.")
+        print("Failed to create scrape run.")
         return
 
-    club_data = fetch_club_urls()
-    print(f"Fetched {len(club_data)} clubs from Supabase")
+    clubs = fetch_club_urls()
+    print(f"Fetched {len(clubs)} clubs.")
 
-    print(f"Processing all {len(club_data)} clubs")
+    results = scrape_all_clubs(clubs, scrape_id)
+    total_slots = sum(results.values())
 
-    slots_per_club = scrape_all_clubs(club_data, scrape_id)
-    total_slots = sum(slots_per_club.values())
-
-    update_scrape_run(scrape_id, 'completed', total_slots, len(club_data))
-    print(f"Scrape run {scrape_id} completed with {total_slots} slots and {len(club_data)} clubs.")
-    print("Scraping process completed successfully!")
-
+    update_scrape_run(scrape_id, 'completed', total_slots, len(clubs))
+    print(f"Done. Scraped {total_slots} slots from {len(clubs)} clubs.")
 
 if __name__ == "__main__":
     main()
