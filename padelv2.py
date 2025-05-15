@@ -230,6 +230,113 @@ def init_driver():
     else:
         logging.info(f"Using proxy: {proxy_url}")
 
+    # Check if running on Render or similar environment
+    import os
+    import platform
+    is_render = os.environ.get('RENDER') == 'true'
+    system_platform = platform.system().lower()
+    
+    logging.info(f"Platform: {system_platform}, Is Render: {is_render}")
+    
+    # Use a different approach for Render environment
+    if is_render or system_platform == 'linux':
+        try:
+            # Use Playwright instead of Selenium on Render
+            # This is a fallback that doesn't require Chrome to be installed
+            from playwright.sync_api import sync_playwright
+            
+            logging.info("Using Playwright for browser automation on Render")
+            playwright = sync_playwright().start()
+            browser = playwright.chromium.launch(
+                headless=True,
+                proxy={"server": proxy_url} if proxy_url else None
+            )
+            context = browser.new_context()
+            page = context.new_page()
+            
+            # Create a wrapper class to make it compatible with Selenium code
+            class PlaywrightWrapper:
+                def __init__(self, page, browser, context, playwright):
+                    self.page = page
+                    self.browser = browser
+                    self.context = context
+                    self.playwright = playwright
+                
+                def get(self, url):
+                    self.page.goto(url)
+                
+                def find_element(self, by, value):
+                    if by == By.TAG_NAME:
+                        return self.page.locator(value)
+                    elif by == By.CSS_SELECTOR:
+                        return self.page.locator(value)
+                    elif by == By.XPATH:
+                        return self.page.locator(f"xpath={value}")
+                    return self.page.locator(value)
+                
+                def find_elements(self, by, value):
+                    return [self.find_element(by, value)]
+                
+                def quit(self):
+                    self.context.close()
+                    self.browser.close()
+                    self.playwright.stop()
+                
+                def save_screenshot(self, path):
+                    self.page.screenshot(path=path)
+            
+            return PlaywrightWrapper(page, browser, context, playwright)
+        except Exception as pw_error:
+            logging.error(f"Playwright initialization failed: {str(pw_error)}")
+            logging.info("Falling back to PhantomJS-like approach...")
+            
+            # If Playwright fails, try a minimal approach with requests
+            # This won't support JS but might be enough for some basic scraping
+            import requests
+            from bs4 import BeautifulSoup
+            
+            class RequestsWrapper:
+                def __init__(self, proxy_url):
+                    self.session = requests.Session()
+                    if proxy_url:
+                        self.session.proxies = {
+                            'http': proxy_url,
+                            'https': proxy_url
+                        }
+                    self.current_url = None
+                    self.current_content = None
+                    self.current_soup = None
+                
+                def get(self, url):
+                    self.current_url = url
+                    response = self.session.get(url)
+                    self.current_content = response.text
+                    self.current_soup = BeautifulSoup(self.current_content, 'html.parser')
+                
+                def find_element(self, by, value):
+                    if by == By.TAG_NAME:
+                        return self.current_soup.find(value)
+                    elif by == By.CSS_SELECTOR:
+                        return self.current_soup.select_one(value)
+                    return None
+                
+                def find_elements(self, by, value):
+                    if by == By.TAG_NAME:
+                        return self.current_soup.find_all(value)
+                    elif by == By.CSS_SELECTOR:
+                        return self.current_soup.select(value)
+                    return []
+                
+                def quit(self):
+                    self.session.close()
+                
+                def save_screenshot(self, path):
+                    with open(path, 'w') as f:
+                        f.write(f"URL: {self.current_url}\n\nContent preview:\n{self.current_content[:500]}...")
+            
+            return RequestsWrapper(proxy_url)
+    
+    # For non-Render environments, use the original approach
     # Setup Chrome options
     opts = uc.ChromeOptions()
     opts.add_argument('--headless=new')
