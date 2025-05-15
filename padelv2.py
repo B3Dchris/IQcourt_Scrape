@@ -337,9 +337,34 @@ def get_court_availability(url, clubs, scrape_id):
             body_text = driver.find_element(By.TAG_NAME, "body").text
             logging.info(f"Page contains text: {body_text[:100]}...")
             
-            # Wait for the time banner to be visible
-            wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "div[style*='grid-template-columns: 150px repeat']"))
-            time.sleep(5)  # Give more time for all elements to load
+            # Check for the 'cannot book' message
+            cannot_book = "You cannot book in the selected date" in body_text
+            if cannot_book:
+                logging.warning(f"[{club_name}] Website shows: 'You cannot book in the selected date. Try an earlier one.'")
+                # Save screenshot for debugging
+                capture_screenshot(driver, f"{club_name}_cannot_book")
+                
+                # Create empty structured data since we can't book on this date
+                structured = {
+                    "club_name": club_name,
+                    "booking_date": booking_date,
+                    "scrape_timestamp": datetime.now().isoformat(),
+                    "courts": []
+                }
+                save_json(structured)
+                logging.info(f"[{club_name}] No slots available due to booking restrictions")
+                return 0
+            
+            # Only wait for the time banner if we can book on this date
+            if not cannot_book:
+                try:
+                    # Wait for the time banner to be visible with a shorter timeout
+                    WebDriverWait(driver, 10).until(lambda d: d.find_elements(By.CSS_SELECTOR, "div[style*='grid-template-columns: 150px repeat']"))
+                    time.sleep(5)  # Give more time for all elements to load
+                except Exception as wait_error:
+                    logging.error(f"Error waiting for time banner: {str(wait_error)}")
+                    # Take a screenshot to see what's on the page
+                    capture_screenshot(driver, f"{club_name}_no_time_banner")
             
             capture_screenshot(driver, club_name)
             
@@ -488,20 +513,8 @@ def get_court_availability(url, clubs, scrape_id):
             # Driver might not be initialized or already closed
             pass
 
-    except Exception as e:
-        logging.error(f"[{club_name}] error: {str(e)}")
-        logging.error(f"[{club_name}] error type: {type(e).__name__}")
-        import traceback
-        logging.error(f"[{club_name}] traceback: {traceback.format_exc()}")
-        return 0
-    finally:
-        try:
-            driver.quit()
-        except:
-            # Driver might not be initialized or already closed
-            pass
-
 def scrape_all_clubs(clubs, scrape_id):
+    # Increase max_workers to process more clubs in parallel
     with ThreadPoolExecutor(max_workers=2) as exec:
         futures = [exec.submit(get_court_availability, c["url"], clubs, scrape_id) for c in clubs]
         return sum(f.result() for f in futures)
