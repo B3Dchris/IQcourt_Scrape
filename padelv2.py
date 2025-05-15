@@ -7,8 +7,9 @@ import math
 import random
 import logging
 import requests
+import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from webdriver_manager.chrome import ChromeDriverManager    
 
@@ -315,48 +316,200 @@ def get_court_availability(url, clubs, scrape_id):
             return 0
 
         driver.get(url)
-        wait = WebDriverWait(driver, 20)
-        wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "#root .bbq2__grid"))
-        time.sleep(3)
+        # Increase timeout to 40 seconds
+        wait = WebDriverWait(driver, 40)
+        
+        # Set booking date to today without needing to click any date button
+        booking_date = datetime.now().strftime('%Y-%m-%d')
+        logging.info(f"Using default date: {booking_date}")
+        
+        # Log page title to help debug
+        logging.info(f"Page title: {driver.title}")
+        
+        # Wait for page to load completely
+        time.sleep(5)
+        
+        try:
+            # Log that we're waiting for the grid
+            logging.info(f"Waiting for grid to load...")
+            
+            # First check if page has loaded at all
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+            logging.info(f"Page contains text: {body_text[:100]}...")
+            
+            # Wait for the time banner to be visible
+            wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, "div[style*='grid-template-columns: 150px repeat']"))
+            time.sleep(5)  # Give more time for all elements to load
+            
+            capture_screenshot(driver, club_name)
+            
+            # Find all court rows - these have the border-b class and grid-template-columns style
+            court_rows = driver.find_elements(By.CSS_SELECTOR, "div.border-b[style*='grid-template-columns']")
+            logging.info(f"Found {len(court_rows)} court rows")
+            
+            if len(court_rows) == 0:
+                logging.error("No court rows found")
+                # Save page source for debugging
+                with open(f"page_source_{club_name.replace(' ', '_')}.html", "w", encoding="utf-8") as f:
+                    f.write(driver.page_source)
+                logging.info(f"Saved page source to page_source_{club_name.replace(' ', '_')}.html")
+                return 0
+            
+            # Extract court names and available slots
+            court_data = []
+            
+            for row in court_rows:
+                try:
+                    # Get the court name from the first div in the row
+                    court_name_div = row.find_element(By.CSS_SELECTOR, "div.group div.truncate")
+                    court_name = court_name_div.text.strip()
+                    
+                    if not court_name or court_name.isdigit():
+                        continue  # Skip rows without proper court names
+                    
+                    logging.info(f"Processing court: {court_name}")
+                    
+                    # Find all slots in this row (those with data-start-hour attribute)
+                    slots = []
+                    
+                    # First, find all time slots
+                    slot_divs = row.find_elements(By.CSS_SELECTOR, "div[data-start-hour]")
+                    logging.info(f"Found {len(slot_divs)} total time slots for {court_name}")
+                    
+                    # In the new format, we need to find the booked slots
+                    # We'll do this by identifying slots that DON'T have the bg-white class
+                    for slot in slot_divs:
+                        try:
+                            # Extract start and end times
+                            start_time = slot.get_attribute("data-start-hour")
+                            end_time = slot.get_attribute("data-end-hour")
+                            
+                            if not start_time or not end_time:
+                                continue
+                                
+                            # Check if the slot has a white background (available)
+                            # If it doesn't have bg-white, it's booked
+                            try:
+                                # Try to find bg-white class
+                                slot.find_element(By.CSS_SELECTOR, "div.bg-white")
+                                # If we get here, the slot is available, so we don't add it to booked slots
+                                logging.debug(f"Available slot: {start_time} - {end_time}")
+                            except Exception:
+                                # If we can't find bg-white, it's booked
+                                # Format times to match expected format
+                                start_parts = start_time.split(":")
+                                end_parts = end_time.split(":")
+                                
+                                # Handle both formats: "6:00" and "6" 
+                                if len(start_parts) == 2:
+                                    sh, sm = int(start_parts[0]), int(start_parts[1])
+                                else:
+                                    sh, sm = int(start_parts[0]), 0
+                                    
+                                if len(end_parts) == 2:
+                                    eh, em = int(end_parts[0]), int(end_parts[1])
+                                else:
+                                    eh, em = int(end_parts[0]), 0
+                                
+                                # Add to booked slots list
+                                slots.append({
+                                    "start_time": f"{sh:02d}:{sm:02d}",
+                                    "end_time": f"{eh:02d}:{em:02d}",
+                                    "status": "Booked"
+                                })
+                                logging.debug(f"Booked slot: {start_time} - {end_time}")
+                        except Exception as slot_error:
+                            logging.error(f"Error processing slot: {str(slot_error)}")
+                            continue
+                    
+                    court_data.append({
+                        "name": court_name,
+                        "slots": slots
+                    })
+                    
+                except Exception as court_error:
+                    logging.error(f"Error processing court row: {str(court_error)}")
+            
+            # Prepare data for structured output
+            structured = {
+                "club_name": club_name,
+                "booking_date": booking_date,
+                "scrape_timestamp": datetime.now().isoformat(),
+                "courts": []
+            }
+            
+            for court in court_data:
+                # The slots are already formatted correctly in the court_data structure
+                structured["courts"].append({"name": court["name"], "slots": court["slots"]})
+            
+            save_json(structured)
+            slot_payloads = []
+            for court in structured["courts"]:
+                cid = ensure_court_exists(club_id, court["name"])
+                if not cid:
+                    continue
+                for s in court["slots"]:
+                    sh, sm = map(int, s["start_time"].split(":"))
+                    eh, em = map(int, s["end_time"].split(":"))
+                    if eh < sh:
+                        eh += 24
+                    dur = (eh*60+em) - (sh*60+sm)
+                    
+                    slot_payloads.append({
+                        "court_id": cid,
+                        "booking_date": structured["booking_date"],
+                        "start_time": s["start_time"],
+                        "end_time": s["end_time"],
+                        "availability": s["status"] == "Available",
+                        "duration_minutes": dur,
+                        "scrape_id": scrape_id,
+                        "scrape_timestamp": structured["scrape_timestamp"]
+                    })
 
-        capture_screenshot(driver, club_name)
+            insert_into_supabase(slot_payloads)
+            logging.info(f"[{club_name}] done ({len(slot_payloads)} slots)")
+            return len(slot_payloads)
+            
+        except Exception as e:
+            logging.error(f"Error parsing grid: {str(e)}")
+            logging.error(f"Grid parsing error details: {type(e).__name__}: {str(e)}")
+            return 0
 
-        grid = driver.find_element(By.CSS_SELECTOR, "#root .bbq2__grid")
-        labels = [e.text for e in grid.find_elements(By.CLASS_NAME, "bbq2__resource__label")]
-        blocks = grid.find_elements(By.CLASS_NAME, "bbq2__slots-resource")
+    except Exception as e:
+        logging.error(f"[{club_name}] error: {str(e)}")
+        logging.error(f"[{club_name}] error type: {type(e).__name__}")
+        import traceback
+        logging.error(f"[{club_name}] traceback: {traceback.format_exc()}")
+        return 0
+    finally:
+        try:
+            driver.quit()
+        except:
+            # Driver might not be initialized or already closed
+            pass
+            
 
-        structured = {
-            "club_name": club_name,
-            "booking_date": datetime.now().strftime("%Y-%m-%d"),
-            "scrape_timestamp": datetime.now().isoformat(),
-            "courts": []
-        }
-
-        offset = 350
-        pph = 39
-        calibration = -1.0 if "Playmore" in club_name else 0.0
-
-        for idx, name in enumerate(labels):
-            if idx >= len(blocks):
-                break
-            slots = []
-            for hole in blocks[idx].find_elements(By.CLASS_NAME, "bbq2__hole"):
-                x = hole.location["x"] - offset
-                w = hole.size["width"]
-                start_hr = x/pph + calibration
-                sh, sm = divmod(int(start_hr*60), 60)
-                sm = 30 if (start_hr - math.floor(start_hr)) >= 0.5 else 0
-                end_hr  = (x + w)/pph + calibration
-                eh, em = divmod(int(end_hr*60), 60)
-                em = 30 if (end_hr - math.floor(end_hr)) >= 0.5 else 0
-                if eh*60+em <= sh*60+sm:
-                    eh += 24
-                end_hr = eh % 24
-                slots.append({
-                    "start_time": f"{sh:02d}:{sm:02d}",
-                    "end_time":   f"{end_hr:02d}:{em:02d}",
-                    "status":     "Booked"
-                })
+                    
+                    if grid_column_match:
+                        start_col = int(grid_column_match.group(1))
+                        end_col = int(grid_column_match.group(2))
+                        
+                        # Map column position to time (subtract 1 because first column is court name)
+                        start_hour = time_headers[start_col - 2] if start_col - 2 < len(time_headers) else 0
+                        end_hour = time_headers[end_col - 2] if end_col - 2 < len(time_headers) else 0
+                        
+                        # If end is less than start, it means it crosses midnight
+                        if end_hour <= start_hour and end_hour != 0:
+                            end_hour += 24
+                            
+                        slots.append({
+                            "start_time": f"{start_hour:02d}:00",
+                            "end_time": f"{end_hour:02d}:00",
+                            "status": "Booked"
+                        })
+                except Exception as cell_error:
+                    logging.error(f"Error processing booking cell: {str(cell_error)}")
+                    continue
             structured["courts"].append({"name": name, "slots": slots})
 
         save_json(structured)
