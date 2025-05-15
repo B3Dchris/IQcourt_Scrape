@@ -487,57 +487,6 @@ def get_court_availability(url, clubs, scrape_id):
         except:
             # Driver might not be initialized or already closed
             pass
-            
-
-                    
-                    if grid_column_match:
-                        start_col = int(grid_column_match.group(1))
-                        end_col = int(grid_column_match.group(2))
-                        
-                        # Map column position to time (subtract 1 because first column is court name)
-                        start_hour = time_headers[start_col - 2] if start_col - 2 < len(time_headers) else 0
-                        end_hour = time_headers[end_col - 2] if end_col - 2 < len(time_headers) else 0
-                        
-                        # If end is less than start, it means it crosses midnight
-                        if end_hour <= start_hour and end_hour != 0:
-                            end_hour += 24
-                            
-                        slots.append({
-                            "start_time": f"{start_hour:02d}:00",
-                            "end_time": f"{end_hour:02d}:00",
-                            "status": "Booked"
-                        })
-                except Exception as cell_error:
-                    logging.error(f"Error processing booking cell: {str(cell_error)}")
-                    continue
-            structured["courts"].append({"name": name, "slots": slots})
-
-        save_json(structured)
-        slot_payloads = []
-        for court in structured["courts"]:
-            cid = ensure_court_exists(club_id, court["name"])
-            if not cid:
-                continue
-            for s in court["slots"]:
-                sh, sm = map(int, s["start_time"].split(":"))
-                eh, em = map(int, s["end_time"].split(":"))
-                if eh < sh:
-                    eh += 24
-                dur = (eh*60+em) - (sh*60+sm)
-                slot_payloads.append({
-                    "court_id": cid,
-                    "booking_date": structured["booking_date"],
-                    "start_time": s["start_time"],
-                    "end_time": s["end_time"],
-                    "availability": False,
-                    "duration_minutes": dur,
-                    "scrape_id": scrape_id,
-                    "scrape_timestamp": structured["scrape_timestamp"]
-                })
-
-        insert_into_supabase(slot_payloads)
-        logging.info(f"[{club_name}] done ({len(slot_payloads)} slots)")
-        return len(slot_payloads)
 
     except Exception as e:
         logging.error(f"[{club_name}] error: {str(e)}")
@@ -566,14 +515,13 @@ def main():
     clubs = fetch_club_urls()
     logging.info(f"Fetched {len(clubs)} clubs")
     
-    # Limit to 5 clubs for testing
-    test_clubs = clubs[:5]
-    logging.info(f"Testing with 5 clubs: {', '.join(c['name'] for c in test_clubs)}")
+    # Process all clubs
+    logging.info(f"Processing all {len(clubs)} clubs")
 
-    total_slots = scrape_all_clubs(test_clubs, scrape_id)
-    update_scrape_run(scrape_id, "completed", total_slots, len(test_clubs))
+    total_slots = scrape_all_clubs(clubs, scrape_id)
+    update_scrape_run(scrape_id, "completed", total_slots, len(clubs))
 
-    logging.info(f"Completed scrape_run={scrape_id}: {total_slots} slots across {len(test_clubs)} clubs")
+    logging.info(f"Completed scrape_run={scrape_id}: {total_slots} slots across {len(clubs)} clubs")
 
 if __name__ == "__main__":
     main()
