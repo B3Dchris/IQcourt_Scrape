@@ -6,12 +6,9 @@ supabase==2.0.3
 # Web scraping and browser automation
 undetected-chromedriver==3.5.5
 selenium==4.16.0
-webdriver-manager==4.0.2
 
-# Utilities
-beautifulsoup4==4.12.2
-dataclasses-json==0.6.1
-requests-html==0.10.0
+# Logging & CLI
+# (Standard Python logging and argparse used — no extra packages needed)
 
 # Testing
 pytest==7.4.3
