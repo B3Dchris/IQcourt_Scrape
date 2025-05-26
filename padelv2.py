@@ -1,647 +1,315 @@
-#!/usr/bin/env python3
 import os
-import json
 import time
 import uuid
-import math
-import random
 import logging
-import requests
-import re
-from pathlib import Path
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
-from webdriver_manager.chrome import ChromeDriverManager    
-
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-
-from supabase import create_client
+import argparse
 from dotenv import load_dotenv
+from datetime import datetime, timezone, timedelta, time as dtime
+from supabase import create_client
+from selenium.common.exceptions import NoSuchElementException
+from selenium.webdriver.common.by import By
+from undetected_chromedriver import Chrome, ChromeOptions
 
-# ——— Configuration —————————————————————————————————————————————
+# --- Setup ---
+load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).parent
-SCREENSHOTS_DIR = BASE_DIR / "webscrape" / "Scraped data" / "screenshots"
-JSON_DIR        = BASE_DIR / "webscrape" / "Scraped data" / "supabase_ready"
-SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-JSON_DIR.mkdir(parents=True, exist_ok=True)
-
-load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-PROXY_USER = os.getenv("SMARTPROXY_USER")
-PROXY_PASS = os.getenv("SMARTPROXY_PASS")
-PROXY_HOST = os.getenv("SMARTPROXY_HOST")
-PROXY_PORTS = os.getenv("SMARTPROXY_PORTS", "10001").split(",")
-CHROME_VERSION = int(os.getenv("CHROME_VERSION_MAIN", "122"))
-
-# —————————————————————————————————————————————————————————————————
-
-def fetch_club_urls():
-    try:
-        resp = supabase.table("clubs").select("id,name,url").execute()
-        return resp.data or []
-    except Exception as e:
-        logging.error(f"fetch_club_urls: {e}")
-        return []
-
-def create_scrape_run():
-    payload = {
-        "run_at": datetime.utcnow().isoformat(),
-        "booking_date": datetime.utcnow().strftime("%Y-%m-%d"),
-        "source": Path(__file__).name,
-        "notes": "Automated scrape of playtomic courts",
-        "slots_scraped": 0,
-        "clubs_covered": 0,
-        "scrape_status": "in_progress"
-    }
-    try:
-        resp = supabase.table("scrape_runs").insert(payload).execute()
-        return resp.data[0]["id"]
-    except Exception as e:
-        logging.error(f"create_scrape_run: {e}")
-        return None
-
-def update_scrape_run(scrape_id, status, slots, clubs):
-    payload = {
-        "scrape_status": status,
-        "slots_scraped": slots,
-        "clubs_covered": clubs
-    }
-    try:
-        supabase.table("scrape_runs").update(payload).eq("id", scrape_id).execute()
-    except Exception as e:
-        logging.error(f"update_scrape_run: {e}")
-
-def ensure_court_exists(club_id, name):
-    if not club_id:
-        return None
-    try:
-        resp = (
-            supabase.table("courts")
-            .select("id")
-            .eq("club_id", club_id)
-            .eq("name", name)
-            .execute()
-        )
-        if resp.data:
-            return resp.data[0]["id"]
-        payload = {
-            "club_id": club_id,
-            "name": name,
-            "created_at": datetime.utcnow().isoformat()
-        }
-        resp = supabase.table("courts").insert(payload).execute()
-        return resp.data[0]["id"]
-    except Exception as e:
-        logging.error(f"ensure_court_exists({club_id},{name}): {e}")
-        return None
-
-def save_json(data: dict):
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    fname = JSON_DIR / f"court_data_{data['club_name'].replace(' ','_')}_{ts}.json"
-    try:
-        with open(fname, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        logging.info(f"Saved JSON → {fname}")
-    except Exception as e:
-        logging.error(f"save_json: {e}")
-
-def insert_into_supabase(slots: list):
-    inserted = 0
-    for slot in slots:
-        try:
-            supabase.table("slots").insert(slot).execute()
-            inserted += 1
-        except Exception as e:
-            msg = str(e)
-            if "overlaps with existing" in msg:
-                continue
-            logging.error(f"insert_slot: {msg}")
-    if inserted:
-        logging.info(f"Inserted {inserted} new slots")
-
-# Cache for working proxies to avoid repeated testing
-WORKING_PROXIES = []
-PROXY_DATA_CACHE = {}
-
-def test_proxy_with_requests(proxy_user, proxy_pass, proxy_host, proxy_port):
-    """Test proxy connection using requests library"""
-    url = 'https://ip.decodo.com/json'
-    proxy_url = f"http://{proxy_user}:{proxy_pass}@{proxy_host}:{proxy_port}"
-    
-    logging.info(f"Testing proxy with requests: {proxy_url}")
-    
-    try:
-        response = requests.get(
-            url, 
-            proxies={
-                'http': proxy_url,
-                'https': proxy_url
-            },
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            logging.info(f"Proxy test successful: {proxy_port}")
-            try:
-                # Try to parse as JSON
-                data = response.json()
-                return True, data
-            except:
-                # If not JSON, still consider it successful
-                return True, response.text
-        else:
-            logging.warning(f"Proxy test failed with status code: {response.status_code}")
-            return False, None
-    except Exception as e:
-        logging.error(f"Proxy request error: {str(e)}")
-        return False, None
-
-def find_working_proxy():
-    """Test all proxy ports and return a working one"""
-    global WORKING_PROXIES, PROXY_DATA_CACHE
-    
-    # If we already have working proxies, use them
-    if WORKING_PROXIES:
-        proxy_port = random.choice(WORKING_PROXIES)
-        proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{proxy_port}"
-        logging.info(f"Using cached working proxy: {proxy_port}")
-        
-        # Log the IP information for the selected proxy if available
-        if proxy_port in PROXY_DATA_CACHE:
-            try:
-                ip_data = PROXY_DATA_CACHE[proxy_port]
-                if isinstance(ip_data, dict) and 'proxy' in ip_data:
-                    logging.info(f"Selected proxy: {proxy_port} - IP: {ip_data['proxy'].get('ip', 'Unknown')}")
-            except:
-                pass
-        return proxy_url
-    
-    # Otherwise test all proxy ports
-    logging.info("Testing proxy ports...")
-    working_ports = []
-    proxy_data = {}
-
-    for port in PROXY_PORTS:
-        success, data = test_proxy_with_requests(PROXY_USER, PROXY_PASS, PROXY_HOST, port)
-        if success:
-            working_ports.append(port)
-            proxy_data[port] = data
-
-    if working_ports:
-        # Cache the working proxies for future use
-        WORKING_PROXIES = working_ports
-        PROXY_DATA_CACHE = proxy_data
-        
-        # Use a random working port
-        proxy_port = random.choice(working_ports)
-        proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{proxy_port}"
-        
-        # Log the IP information for the selected proxy
-        if proxy_port in proxy_data:
-            try:
-                ip_data = proxy_data[proxy_port]
-                if isinstance(ip_data, dict) and 'proxy' in ip_data:
-                    logging.info(f"Selected proxy: {proxy_port} - IP: {ip_data['proxy'].get('ip', 'Unknown')}")
-                    logging.info(f"Location: {ip_data.get('country', {}).get('name', 'Unknown')}, {ip_data.get('city', {}).get('name', 'Unknown')}")
-            except:
-                pass
-        return proxy_url
-    else:
-        logging.error("No working proxy ports found")
-        return None
-
+# --- Init Chrome ---
 def init_driver():
-    # Find a working proxy
-    proxy_url = find_working_proxy()
-    
-    if not proxy_url:
-        logging.warning("Falling back to direct connection (no proxy)")
-    else:
-        logging.info(f"Using proxy: {proxy_url}")
+    options = ChromeOptions()
+    options.add_argument('--headless=new')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--window-size=1920,1080')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    return Chrome(options=options)
 
-    # Check if running on Render or similar environment
-    import os
-    import platform
-    is_render = os.environ.get('RENDER') == 'true'
-    system_platform = platform.system().lower()
-    
-    logging.info(f"Platform: {system_platform}, Is Render: {is_render}")
-    
-    # Use a different approach for Render environment
-    if is_render or system_platform == 'linux':
-        try:
-            # Use Playwright instead of Selenium on Render
-            # This is a fallback that doesn't require Chrome to be installed
-            from playwright.sync_api import sync_playwright
-            
-            logging.info("Using Playwright for browser automation on Render")
-            playwright = sync_playwright().start()
-            browser = playwright.chromium.launch(
-                headless=True,
-                proxy={"server": proxy_url} if proxy_url else None
-            )
-            context = browser.new_context()
-            page = context.new_page()
-            
-            # Create a wrapper class to make it compatible with Selenium code
-            class PlaywrightWrapper:
-                def __init__(self, page, browser, context, playwright):
-                    self.page = page
-                    self.browser = browser
-                    self.context = context
-                    self.playwright = playwright
-                
-                def get(self, url):
-                    self.page.goto(url)
-                
-                def find_element(self, by, value):
-                    if by == By.TAG_NAME:
-                        return self.page.locator(value)
-                    elif by == By.CSS_SELECTOR:
-                        return self.page.locator(value)
-                    elif by == By.XPATH:
-                        return self.page.locator(f"xpath={value}")
-                    return self.page.locator(value)
-                
-                def find_elements(self, by, value):
-                    return [self.find_element(by, value)]
-                
-                def quit(self):
-                    self.context.close()
-                    self.browser.close()
-                    self.playwright.stop()
-                
-                def save_screenshot(self, path):
-                    self.page.screenshot(path=path)
-            
-            return PlaywrightWrapper(page, browser, context, playwright)
-        except Exception as pw_error:
-            logging.error(f"Playwright initialization failed: {str(pw_error)}")
-            logging.info("Falling back to PhantomJS-like approach...")
-            
-            # If Playwright fails, try a minimal approach with requests
-            # This won't support JS but might be enough for some basic scraping
-            import requests
-            from bs4 import BeautifulSoup
-            
-            class RequestsWrapper:
-                def __init__(self, proxy_url):
-                    self.session = requests.Session()
-                    if proxy_url:
-                        self.session.proxies = {
-                            'http': proxy_url,
-                            'https': proxy_url
-                        }
-                    self.current_url = None
-                    self.current_content = None
-                    self.current_soup = None
-                
-                def get(self, url):
-                    self.current_url = url
-                    response = self.session.get(url)
-                    self.current_content = response.text
-                    self.current_soup = BeautifulSoup(self.current_content, 'html.parser')
-                
-                def find_element(self, by, value):
-                    if by == By.TAG_NAME:
-                        return self.current_soup.find(value)
-                    elif by == By.CSS_SELECTOR:
-                        return self.current_soup.select_one(value)
-                    return None
-                
-                def find_elements(self, by, value):
-                    if by == By.TAG_NAME:
-                        return self.current_soup.find_all(value)
-                    elif by == By.CSS_SELECTOR:
-                        return self.current_soup.select(value)
-                    return []
-                
-                def quit(self):
-                    self.session.close()
-                
-                def save_screenshot(self, path):
-                    with open(path, 'w') as f:
-                        f.write(f"URL: {self.current_url}\n\nContent preview:\n{self.current_content[:500]}...")
-            
-            return RequestsWrapper(proxy_url)
-    
-    # For non-Render environments, use the original approach
-    # Setup Chrome options
-    opts = uc.ChromeOptions()
-    opts.add_argument('--headless=new')
-    opts.add_argument('--no-sandbox')
-    opts.add_argument('--disable-dev-shm-usage')
-    opts.add_argument('--start-maximized')
-    opts.add_argument('--disable-blink-features=AutomationControlled')
-    
-    # Add proxy if available
-    if proxy_url:
-        opts.add_argument(f'--proxy-server={proxy_url}')
-    
-    # Add arguments to help with stability
-    opts.add_argument('--disable-extensions')
-    opts.add_argument('--disable-gpu')
-    opts.add_argument('--disable-infobars')
-    opts.add_argument('--disable-notifications')
-    opts.add_argument('--disable-popup-blocking')
-    
-    # Use regular Selenium with webdriver_manager as a fallback
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
-    
+# --- Supabase Functions ---
+def create_scrape_run():
+    scrape_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "id": scrape_id,
+        "run_at": now,
+        "start_time": now,
+        "status": "running",
+        "total_slots": 0,
+        "booking_date": datetime.now().date().isoformat()
+    }
     try:
-        # First try with undetected_chromedriver
-        try:
-            driver = uc.Chrome(options=opts, version_main=CHROME_VERSION)
-            return driver
-        except Exception as e:
-            logging.error(f"Failed with undetected_chromedriver: {str(e)}")
-            logging.info("Falling back to regular Selenium WebDriver...")
-            
-            # Fall back to regular Selenium with webdriver_manager
-            chrome_options = webdriver.ChromeOptions()
-            chrome_options.add_argument('--headless=new')
-            chrome_options.add_argument('--no-sandbox')
-            chrome_options.add_argument('--disable-dev-shm-usage')
-            
-            if proxy_url:
-                chrome_options.add_argument(f'--proxy-server={proxy_url}')
-            
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            return driver
-            
+        supabase.table("scrape_runs").insert(payload).execute()
+        logger.info("Created scrape run %s", scrape_id)
     except Exception as e:
-        # If everything fails, try one more time without proxy
-        logging.error(f"All Chrome initialization attempts failed: {str(e)}")
-        logging.info("Final attempt without proxy...")
-        
-        try:
-            # Simple options for maximum compatibility
-            chrome_options = webdriver.ChromeOptions()
-            chrome_options.add_argument('--headless=new')
-            chrome_options.add_argument('--no-sandbox')
-            
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            return driver
-        except Exception as final_e:
-            logging.error(f"Final attempt failed: {str(final_e)}")
-            raise
+        logger.error("Error creating scrape run: %s", e)
+    return scrape_id
 
-def capture_screenshot(driver, club_name):
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    fname = SCREENSHOTS_DIR / f"{club_name.replace(' ','_')}_{ts}.png"
-    driver.save_screenshot(str(fname))
-    logging.info(f"Screenshot → {fname}")
+def fetch_clubs():
+    res = supabase.table("clubs").select("id,name,url").execute()
+    return res.data if res.data else []
 
-def get_court_availability(url, clubs, scrape_id):
+def ensure_court_exists(club_id, court_name):
     try:
-        uuid_part = url.rstrip("/").split("/")[-1].split("?")[0]
-        info = next((c for c in clubs if uuid_part in c["url"]), {})
-        club_name = info.get("name", "unknown")
-        club_id   = info.get("id")
-        logging.info(f"[{club_name}] start scraping")
-        
-        # Initialize driver inside the try block
-        try:
-            driver = init_driver()
-        except Exception as driver_error:
-            logging.error(f"[{club_name}] Driver initialization error: {str(driver_error)}")
-            return 0
-
-        driver.get(url)
-        # Increase timeout to 40 seconds
-        wait = WebDriverWait(driver, 40)
-        
-        # Set booking date to today without needing to click any date button
-        booking_date = datetime.now().strftime('%Y-%m-%d')
-        logging.info(f"Using default date: {booking_date}")
-        
-        # Log page title to help debug
-        logging.info(f"Page title: {driver.title}")
-        
-        # Wait for page to load completely
-        time.sleep(5)
-        
-        try:
-            # Log that we're waiting for the grid
-            logging.info(f"Waiting for grid to load...")
-            
-            # First check if page has loaded at all
-            body_text = driver.find_element(By.TAG_NAME, "body").text
-            logging.info(f"Page contains text: {body_text[:100]}...")
-            
-            # Check for the 'cannot book' message
-            cannot_book = "You cannot book in the selected date" in body_text
-            if cannot_book:
-                logging.warning(f"[{club_name}] Website shows: 'You cannot book in the selected date. Try an earlier one.'")
-                # Save screenshot for debugging
-                capture_screenshot(driver, f"{club_name}_cannot_book")
-                
-                # Create empty structured data since we can't book on this date
-                structured = {
-                    "club_name": club_name,
-                    "booking_date": booking_date,
-                    "scrape_timestamp": datetime.now().isoformat(),
-                    "courts": []
-                }
-                save_json(structured)
-                logging.info(f"[{club_name}] No slots available due to booking restrictions")
-                return 0
-            
-            # Only wait for the time banner if we can book on this date
-            if not cannot_book:
-                try:
-                    # Wait for the time banner to be visible with a shorter timeout
-                    WebDriverWait(driver, 10).until(lambda d: d.find_elements(By.CSS_SELECTOR, "div[style*='grid-template-columns: 150px repeat']"))
-                    time.sleep(5)  # Give more time for all elements to load
-                except Exception as wait_error:
-                    logging.error(f"Error waiting for time banner: {str(wait_error)}")
-                    # Take a screenshot to see what's on the page
-                    capture_screenshot(driver, f"{club_name}_no_time_banner")
-            
-            capture_screenshot(driver, club_name)
-            
-            # Find all court rows - these have the border-b class and grid-template-columns style
-            court_rows = driver.find_elements(By.CSS_SELECTOR, "div.border-b[style*='grid-template-columns']")
-            logging.info(f"Found {len(court_rows)} court rows")
-            
-            if len(court_rows) == 0:
-                logging.error("No court rows found")
-                # Save page source for debugging
-                with open(f"page_source_{club_name.replace(' ', '_')}.html", "w", encoding="utf-8") as f:
-                    f.write(driver.page_source)
-                logging.info(f"Saved page source to page_source_{club_name.replace(' ', '_')}.html")
-                return 0
-            
-            # Extract court names and available slots
-            court_data = []
-            
-            for row in court_rows:
-                try:
-                    # Get the court name from the first div in the row
-                    court_name_div = row.find_element(By.CSS_SELECTOR, "div.group div.truncate")
-                    court_name = court_name_div.text.strip()
-                    
-                    if not court_name or court_name.isdigit():
-                        continue  # Skip rows without proper court names
-                    
-                    logging.info(f"Processing court: {court_name}")
-                    
-                    # Find all slots in this row (those with data-start-hour attribute)
-                    slots = []
-                    
-                    # First, find all time slots
-                    slot_divs = row.find_elements(By.CSS_SELECTOR, "div[data-start-hour]")
-                    logging.info(f"Found {len(slot_divs)} total time slots for {court_name}")
-                    
-                    # In the new format, we need to find the booked slots
-                    # We'll do this by identifying slots that DON'T have the bg-white class
-                    for slot in slot_divs:
-                        try:
-                            # Extract start and end times
-                            start_time = slot.get_attribute("data-start-hour")
-                            end_time = slot.get_attribute("data-end-hour")
-                            
-                            if not start_time or not end_time:
-                                continue
-                                
-                            # Check if the slot has a white background (available)
-                            # If it doesn't have bg-white, it's booked
-                            try:
-                                # Try to find bg-white class
-                                slot.find_element(By.CSS_SELECTOR, "div.bg-white")
-                                # If we get here, the slot is available, so we don't add it to booked slots
-                                logging.debug(f"Available slot: {start_time} - {end_time}")
-                            except Exception:
-                                # If we can't find bg-white, it's booked
-                                # Format times to match expected format
-                                start_parts = start_time.split(":")
-                                end_parts = end_time.split(":")
-                                
-                                # Handle both formats: "6:00" and "6" 
-                                if len(start_parts) == 2:
-                                    sh, sm = int(start_parts[0]), int(start_parts[1])
-                                else:
-                                    sh, sm = int(start_parts[0]), 0
-                                    
-                                if len(end_parts) == 2:
-                                    eh, em = int(end_parts[0]), int(end_parts[1])
-                                else:
-                                    eh, em = int(end_parts[0]), 0
-                                
-                                # Add to booked slots list
-                                slots.append({
-                                    "start_time": f"{sh:02d}:{sm:02d}",
-                                    "end_time": f"{eh:02d}:{em:02d}",
-                                    "status": "Booked"
-                                })
-                                logging.debug(f"Booked slot: {start_time} - {end_time}")
-                        except Exception as slot_error:
-                            logging.error(f"Error processing slot: {str(slot_error)}")
-                            continue
-                    
-                    court_data.append({
-                        "name": court_name,
-                        "slots": slots
-                    })
-                    
-                except Exception as court_error:
-                    logging.error(f"Error processing court row: {str(court_error)}")
-            
-            # Prepare data for structured output
-            structured = {
-                "club_name": club_name,
-                "booking_date": booking_date,
-                "scrape_timestamp": datetime.now().isoformat(),
-                "courts": []
-            }
-            
-            for court in court_data:
-                # The slots are already formatted correctly in the court_data structure
-                structured["courts"].append({"name": court["name"], "slots": court["slots"]})
-            
-            save_json(structured)
-            slot_payloads = []
-            for court in structured["courts"]:
-                cid = ensure_court_exists(club_id, court["name"])
-                if not cid:
-                    continue
-                for s in court["slots"]:
-                    sh, sm = map(int, s["start_time"].split(":"))
-                    eh, em = map(int, s["end_time"].split(":"))
-                    if eh < sh:
-                        eh += 24
-                    dur = (eh*60+em) - (sh*60+sm)
-                    
-                    slot_payloads.append({
-                        "court_id": cid,
-                        "booking_date": structured["booking_date"],
-                        "start_time": s["start_time"],
-                        "end_time": s["end_time"],
-                        "availability": s["status"] == "Available",
-                        "duration_minutes": dur,
-                        "scrape_id": scrape_id,
-                        "scrape_timestamp": structured["scrape_timestamp"]
-                    })
-
-            insert_into_supabase(slot_payloads)
-            logging.info(f"[{club_name}] done ({len(slot_payloads)} slots)")
-            return len(slot_payloads)
-            
-        except Exception as e:
-            logging.error(f"Error parsing grid: {str(e)}")
-            logging.error(f"Grid parsing error details: {type(e).__name__}: {str(e)}")
-            return 0
-
+        query = supabase.table("courts").select("id").eq("club_id", club_id).eq("name", court_name).execute()
+        if query.data:
+            return query.data[0]["id"]
+        court_id = str(uuid.uuid4())
+        supabase.table("courts").insert({"id": court_id, "club_id": club_id, "name": court_name}).execute()
+        return court_id
     except Exception as e:
-        logging.error(f"[{club_name}] error: {str(e)}")
-        logging.error(f"[{club_name}] error type: {type(e).__name__}")
-        import traceback
-        logging.error(f"[{club_name}] traceback: {traceback.format_exc()}")
-        return 0
-    finally:
-        try:
-            driver.quit()
-        except:
-            # Driver might not be initialized or already closed
-            pass
+        logger.error("Error ensuring court exists: %s", e)
+        return None
 
-def scrape_all_clubs(clubs, scrape_id):
-    # Increase max_workers to process more clubs in parallel
-    with ThreadPoolExecutor(max_workers=2) as exec:
-        futures = [exec.submit(get_court_availability, c["url"], clubs, scrape_id) for c in clubs]
-        return sum(f.result() for f in futures)
+def replace_slots_for_day(booking_date):
+    time.sleep(2)  # Add a small delay to ensure delete completes
+    try:
+        supabase.table("slots").delete().eq("booking_date", booking_date).execute()
+        logger.info("Deleted existing slots for %s", booking_date)
+    except Exception as e:
+        logger.error("Failed to delete existing slots: %s", e)
 
-def main():
-    scrape_id = create_scrape_run()
-    if not scrape_id:
-        logging.error("Failed to create scrape run")
+def insert_slots(slots, booking_date):
+    if not slots:
+        logger.warning("No slots to insert")
         return
-
-    clubs = fetch_club_urls()
-    logging.info(f"Fetched {len(clubs)} clubs")
     
-    # Process all clubs
-    logging.info(f"Processing all {len(clubs)} clubs")
+    # Filter to only include available slots
+    available_slots = [slot for slot in slots if slot.get("availability", False) == True]
+    logger.info("Filtered %d slots to %d available slots", len(slots), len(available_slots))
+    
+    if not available_slots:
+        logger.warning("No available slots to insert")
+        return
+    
+    # Add detailed logging before insert
+    logger.info("=== DETAILED SLOT ANALYSIS ===")
+    
+    # Group slots by court to identify potential overlaps
+    courts = {}
+    for slot in available_slots:
+        court_id = slot["court_id"]
+        if court_id not in courts:
+            courts[court_id] = []
+        courts[court_id].append(slot)
+    
+    # Sort slots by start time for each court and look for overlaps
+    for court_id, court_slots in courts.items():
+        court_slots.sort(key=lambda x: x["start_time"])
+        logger.info(f"Court ID: {court_id} - {len(court_slots)} slots")
+        
+        # Check for potential overlaps
+        for i in range(len(court_slots) - 1):
+            curr = court_slots[i]
+            next_slot = court_slots[i + 1]
+            
+            # Check if this slot ends after the next one starts
+            if curr["end_time"] > next_slot["start_time"]:
+                logger.warning(f"POTENTIAL OVERLAP: Court {court_id}")
+                logger.warning(f"  Slot 1: {curr['start_time']} to {curr['end_time']}")
+                logger.warning(f"  Slot 2: {next_slot['start_time']} to {next_slot['end_time']}")
+    
+    # Export all slots to a JSON file for investigation
+    import json
+    with open(f"slots_debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", "w") as f:
+        json.dump(available_slots, f, indent=2)
+    logger.info(f"Exported {len(available_slots)} available slots to JSON for debugging")
+    
+    # Continue with normal operation
+    replace_slots_for_day(booking_date)
+    try:
+        supabase.table("slots").insert(available_slots).execute()
+        logger.info("Inserted %d available slots for %s", len(available_slots), booking_date)
+    except Exception as e:
+        if hasattr(e, 'response') and hasattr(e.response, 'json'):
+            logger.error("Insert error detail: %s", e.response.json())
+        logger.error("Error inserting slots: %s", e)
+        
+        # Try inserting one by one to identify problem slots
+        logger.info("Attempting slot-by-slot insert to identify problematic slots...")
+        success_count = 0
+        for i, slot in enumerate(available_slots):
+            try:
+                supabase.table("slots").insert([slot]).execute()
+                success_count += 1
+            except Exception as slot_error:
+                logger.error("Error inserting slot %d: %s", i, slot)
+                if hasattr(slot_error, 'response') and hasattr(slot_error.response, 'json'):
+                    logger.error("Error details: %s", slot_error.response.json())
+        
+        logger.info("Successfully inserted %d/%d slots individually", success_count, len(available_slots))
 
-    total_slots = scrape_all_clubs(clubs, scrape_id)
-    update_scrape_run(scrape_id, "completed", total_slots, len(clubs))
+def dedupe_slots(slots):
+    """
+    Deduplicates slots and merges overlapping slots for the same court on the same date.
+    """
+    # Group slots by court_id and booking_date
+    grouped_slots = {}
+    for slot in slots:
+        key = (slot["court_id"], slot["booking_date"])
+        if key not in grouped_slots:
+            grouped_slots[key] = []
+        grouped_slots[key].append(slot)
+    
+    result = []
+    for (court_id, booking_date), court_slots in grouped_slots.items():
+        # Sort slots by start_time
+        court_slots.sort(key=lambda x: x["start_time"])
+        
+        # Merge overlapping slots
+        merged = []
+        for slot in court_slots:
+            # Convert times to comparable format
+            start_time = slot["start_time"]
+            end_time = slot["end_time"]
+            
+            if not merged:
+                # First slot
+                merged.append(slot)
+            else:
+                prev_slot = merged[-1]
+                prev_end = prev_slot["end_time"]
+                
+                # Check if current slot overlaps with previous slot
+                if start_time <= prev_end:
+                    # Slots overlap, merge them by taking the later end time
+                    if end_time > prev_end:
+                        # Update duration in minutes
+                        from datetime import datetime
+                        start_dt = datetime.strptime(prev_slot["start_time"], "%H:%M:%S")
+                        end_dt = datetime.strptime(end_time, "%H:%M:%S")
+                        duration = int((end_dt - start_dt).total_seconds() / 60)
+                        
+                        # Update the previous slot with the new end time and duration
+                        prev_slot["end_time"] = end_time
+                        prev_slot["duration_minutes"] = duration
+                else:
+                    # No overlap, add as a new slot
+                    merged.append(slot)
+        
+        # Add the merged slots to the result
+        result.extend(merged)
+    
+    logger.info(f"Deduplicated slots from {len(slots)} to {len(result)} after merging overlaps")
+    return result
 
-    logging.info(f"Completed scrape_run={scrape_id}: {total_slots} slots across {len(clubs)} clubs")
+def merge_overlapping_intervals(intervals):
+    intervals = sorted(intervals, key=lambda x: x[0])
+    merged = []
+    for start, end in intervals:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+def extract_courts(club, scrape_id, booking_date):
+    from datetime import datetime as dt
+
+    url = club["url"]
+    club_id = club["id"]
+    slots_data = []
+    logger.info("Scraping %s", url)
+
+    try:
+        with init_driver() as driver:
+            driver.get(url)
+            time.sleep(5)
+            
+            # Log the HTML content for debugging
+            page_html = driver.page_source
+            with open(f"debug_html_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html", "w", encoding="utf-8") as f:
+                f.write(page_html)
+            logger.info(f"Saved HTML content to debug_html_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
+            
+            rows = driver.find_elements(By.CSS_SELECTOR, "div.border-b")
+            logger.info("Found %d court rows for club: %s", len(rows), club["name"])
+
+            for index, row in enumerate(rows):
+                try:
+                    court_name = f"Court {index+1}"
+                    try:
+                        court_name_el = row.find_element(By.CSS_SELECTOR, "div.font-medium")
+                        court_name = court_name_el.text.strip() or court_name
+                    except NoSuchElementException:
+                        pass
+
+                    court_id = ensure_court_exists(club_id, court_name)
+                    if not court_id:
+                        continue
+
+                    slot_elements = row.find_elements(By.CSS_SELECTOR, "div[data-start-hour][data-end-hour]")
+                    fmt = "%H:%M"
+
+                    # Create available slots
+                    for el in slot_elements:
+                        start_time = el.get_attribute("data-start-hour")
+                        end_time = el.get_attribute("data-end-hour")
+                        start = dt.strptime(start_time, fmt).time()
+                        end = dt.strptime(end_time, fmt).time()
+                        
+                        # Calculate duration in minutes
+                        start_dt = dt.combine(dt.today(), start)
+                        end_dt = dt.combine(dt.today(), end)
+                        duration = int((end_dt - start_dt).total_seconds() / 60)
+                        
+                        # Log the slot element details
+                        logger.info(f"Found available slot: {court_name}, {start_time}-{end_time}, class: {el.get_attribute('class')}")
+                        
+                        # Create the available slot
+                        slots_data.append({
+                            "court_id": court_id,
+                            "booking_date": booking_date,
+                            "start_time": start.strftime("%H:%M:%S"),
+                            "end_time": end.strftime("%H:%M:%S"),
+                            "duration_minutes": duration,
+                            "availability": True,  # This slot is available
+                            "scrape_id": scrape_id,
+                            "scrape_timestamp": datetime.now(timezone.utc).isoformat()
+                        })
+
+                except Exception as e:
+                    logger.warning("Error on court row %s: %s", index, e)
+                    logger.exception("Full traceback for court row error:")
+
+    except Exception as e:
+        logger.error("Driver failure for %s: %s", club.get("name", "Unknown"), e)
+        logger.exception("Full traceback for driver failure:")
+
+    logger.info(f"Extracted {len(slots_data)} available slots")
+    return slots_data
+
+# --- Main ---
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=None, help="Number of clubs to process (default: all)")
+    args = parser.parse_args()
+
+    scrape_id = create_scrape_run()
+    booking_date = datetime.now().date().isoformat()
+    clubs = fetch_clubs()
+    logger.info("Found %d clubs", len(clubs))
+
+    total_slots = []
+    # Process all clubs if limit is None, otherwise respect the limit
+    clubs_to_process = clubs[:args.limit] if args.limit else clubs
+    logger.info("Processing %d clubs", len(clubs_to_process))
+    
+    for club in clubs_to_process:
+        logger.info("Processing club: %s (%s)", club["name"], club["url"])
+        total_slots += extract_courts(club, scrape_id, booking_date)
+
+    total_slots = dedupe_slots(total_slots)
+    logger.info("Total slots before insert: %d", len(total_slots))
+    insert_slots(total_slots, booking_date)
+    logger.info("Scraper finished successfully.")
 
 if __name__ == "__main__":
     main()
