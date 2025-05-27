@@ -4,7 +4,7 @@ python-dotenv==1.1.0
 supabase==2.0.3
 
 # Web scraping and browser automation
-undetected-chromedriver==3.5.5
+undetected-chromedriver==3.4.6
 selenium==4.16.0
 
 # Logging & CLI
