@@ -1,10 +1,6 @@
 services:
-  - type: web
-    name: padel-scraper
+  - type: worker
+    name: padel-scraper-worker
     env: docker
     plan: free
-    region: oregon
     dockerfilePath: ./Dockerfile
-    autoDeploy: true
-    buildCommand: ""
-    startCommand: ""
