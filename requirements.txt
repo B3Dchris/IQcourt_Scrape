@@ -4,7 +4,7 @@ python-dotenv==1.1.0
 supabase==2.0.3
 
 # Web scraping and browser automation
-
+webdriver-manager==4.0.1
 selenium==4.16.0
 
 
