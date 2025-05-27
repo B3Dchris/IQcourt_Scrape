@@ -1,31 +1,11 @@
-# Use slim Python image
 FROM python:3.11-slim
 
-# Install system deps
+# Install system packages
 RUN apt-get update && apt-get install -y \
-    wget \
-    unzip \
-    curl \
-    gnupg \
-    ca-certificates \
-    fonts-liberation \
-    libasound2 \
-    libatk-bridge2.0-0 \
-    libatk1.0-0 \
-    libc6 \
-    libcairo2 \
-    libcups2 \
-    libdbus-1-3 \
-    libgdk-pixbuf2.0-0 \
-    libnspr4 \
-    libnss3 \
-    libx11-xcb1 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
-    xdg-utils \
-    libgbm-dev \
-    libxshmfence-dev \
+    wget unzip curl gnupg ca-certificates \
+    fonts-liberation libasound2 libatk-bridge2.0-0 libatk1.0-0 libc6 libcairo2 \
+    libcups2 libdbus-1-3 libgdk-pixbuf2.0-0 libnspr4 libnss3 libx11-xcb1 \
+    libxcomposite1 libxdamage1 libxrandr2 xdg-utils libgbm-dev libxshmfence-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Chrome
@@ -41,16 +21,17 @@ RUN CHROME_VERSION=$(google-chrome --version | awk '{ print $3 }' | cut -d '.' -
     && chmod +x /usr/local/bin/chromedriver \
     && rm chromedriver_linux64.zip
 
-# Set env for u-chromedriver to find Chrome
 ENV GOOGLE_CHROME_BIN=/usr/bin/google-chrome
 
-# Install Python deps
+# Set working directory
 WORKDIR /app
-COPY requirements.txt requirements.txt
-RUN pip install -r requirements.txt
 
-# Copy app
+# Copy files and install Python deps
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+# Copy all app files
 COPY . .
 
-# Run
+# Entry point (edit if needed)
 CMD ["python", "padelv2.py"]
