@@ -65,12 +65,18 @@ def insert_slots(slots, booking_date):
                 logger.error("Single insert failed: %s", ex)
 
 def init_driver():
-    options = webdriver.ChromeOptions()
-    options.add_argument('--headless=new')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--window-size=1920,1080')
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+
+    # This is the key line for Render/Chromium setup:
+    options.binary_location = "/usr/bin/chromium"
+
+    # Use webdriver-manager to fetch a matching driver
+    from webdriver_manager.chrome import ChromeDriverManager
+    service = Service(ChromeDriverManager().install())
+    return webdriver.Chrome(service=service, options=options)
 
 def scrape_club(club, scrape_id, booking_date):
     driver = init_driver()
