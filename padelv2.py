@@ -31,12 +31,12 @@ def init_driver():
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--window-size=1920,1080')
     options.add_argument('--disable-blink-features=AutomationControlled')
-    # --- Force binary location ---
-    chrome_bin = "/usr/bin/google-chrome"  # This is the standard path after apt install
-    if not os.path.exists(chrome_bin):
-        raise RuntimeError("Chrome binary not found at /usr/bin/google-chrome. Did you install it?")
     
-    options.binary_location = chrome_bin
+    chrome_bin = "/usr/bin/google-chrome"
+    if os.path.exists(chrome_bin):
+        options.binary_location = chrome_bin  # only set if exists
+    else:
+        logger.warning("Chrome binary not found at %s; using default binary", chrome_bin)
 
     return Chrome(options=options)
 
