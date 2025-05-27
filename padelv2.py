@@ -9,6 +9,34 @@ from supabase import create_client
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.by import By
 from undetected_chromedriver import Chrome, ChromeOptions
+import subprocess
+
+def ensure_chrome_installed():
+    if not os.path.exists("/usr/bin/google-chrome"):
+        subprocess.run([
+            "apt-get", "update"
+        ], check=True)
+        subprocess.run([
+            "apt-get", "install", "-y", "wget", "curl", "gnupg", "unzip", "fonts-liberation",
+            "libnss3", "libxss1", "libasound2", "libatk-bridge2.0-0", "libgtk-3-0", "libx11-xcb1",
+            "libgbm-dev", "libu2f-udev", "xdg-utils"
+        ], check=True)
+        subprocess.run([
+            "curl", "-fsSL", "https://dl.google.com/linux/linux_signing_key.pub"
+        ], stdout=open("/usr/share/keyrings/google-linux-keyring.gpg", "wb"), check=True)
+        subprocess.run([
+            "bash", "-c",
+            "echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main' > /etc/apt/sources.list.d/google-chrome.list"
+        ], check=True)
+        subprocess.run([
+            "apt-get", "update"
+        ], check=True)
+        subprocess.run([
+            "apt-get", "install", "-y", "google-chrome-stable"
+        ], check=True)
+
+ensure_chrome_installed()
+
 
 # --- Setup ---
 load_dotenv()
