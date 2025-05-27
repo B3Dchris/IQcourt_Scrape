@@ -2,8 +2,7 @@ services:
   - type: worker
     name: padel-scraper-worker
     env: python
-    plan: starter
-    buildCommand: |
-      pip install -r requirements.txt
-      python -m playwright install chromium
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    postBuildCommand: python -m playwright install chromium
     startCommand: python padelv2.py
